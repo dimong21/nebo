@@ -44,6 +44,7 @@ WAITING_REVIEW_ANONYMOUS = 4
 WAITING_REVIEW_RATING = 5
 WAITING_REVIEW_TEXT = 6
 WAITING_ADMIN_PREFIX = 7
+WAITING_MUTE_REASON = 8
 
 class Database:
     def __init__(self, db_path="bot.db"):
@@ -153,6 +154,13 @@ class Database:
             )
         ''')
 
+        # Автоматически добавляем владельца как админа
+        if OWNER_ID:
+            self.cursor.execute('''
+                INSERT OR IGNORE INTO admins (user_id, username, display_name, prefix, position, level, permissions)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (OWNER_ID, 'owner', 'Владелец', '👑', '👑 Создатель', 99, '["all"]'))
+        
         self.conn.commit()
 
     def add_user(self, user_id: int, username: str, first_name: str, last_name: str = ""):
@@ -161,6 +169,15 @@ class Database:
             VALUES (?, ?, ?, ?)
         ''', (user_id, username, first_name, last_name))
         self.conn.commit()
+
+    def get_user_by_username(self, username: str) -> Optional[int]:
+        self.cursor.execute('SELECT user_id FROM users WHERE username = ?', (username,))
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+
+    def get_user_by_id(self, user_id: int):
+        self.cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        return self.cursor.fetchone()
 
     def is_banned(self, user_id: int) -> bool:
         self.cursor.execute('SELECT is_banned, ban_until FROM users WHERE user_id = ?', (user_id,))
@@ -210,7 +227,7 @@ class Database:
         self.cursor.execute('UPDATE users SET is_banned = 0, ban_until = NULL WHERE user_id = ?', (user_id,))
         self.conn.commit()
 
-    def mute_user(self, user_id: int, until: Optional[datetime]):
+    def mute_user(self, user_id: int, until: Optional[datetime], reason: str = ""):
         self.cursor.execute('UPDATE users SET is_muted = 1, mute_until = ? WHERE user_id = ?',
                           (until.isoformat() if until else None, user_id))
         self.conn.commit()
@@ -349,7 +366,6 @@ class Database:
         ''', (user_id, username, display_name, is_anonymous, category, admin_id, rating, text))
         self.conn.commit()
         
-        # Обновляем рейтинг админа
         if admin_id:
             self.cursor.execute('''
                 SELECT AVG(rating), COUNT(*) FROM reviews WHERE admin_id = ?
@@ -363,9 +379,8 @@ class Database:
     def increment_admin_stats(self, admin_id: int, stat_type: str):
         today = datetime.now().strftime('%Y-%m-%d')
         self.cursor.execute('''
-            INSERT INTO daily_stats (admin_id, date, appeals_taken, messages_sent)
+            INSERT OR IGNORE INTO daily_stats (admin_id, date, appeals_taken, messages_sent)
             VALUES (?, ?, 0, 0)
-            ON CONFLICT DO NOTHING
         ''', (admin_id, today))
 
         if stat_type == "appeal":
@@ -380,7 +395,20 @@ class Database:
             ''', (admin_id, today))
         self.conn.commit()
 
+    def get_all_users(self):
+        self.cursor.execute('SELECT user_id FROM users WHERE is_banned = 0')
+        return self.cursor.fetchall()
+
 db = Database()
+
+def owner_required(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if user_id != OWNER_ID:
+            await update.message.reply_text("❌ Эта команда только для владельца!")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
 
 def parse_time(time_str: str) -> Optional[datetime]:
     match = re.match(r'(\d+)([mhd])', time_str.lower())
@@ -397,14 +425,21 @@ def parse_time(time_str: str) -> Optional[datetime]:
     return None
 
 def extract_user_id(text: str) -> Optional[int]:
-    """Извлекает user_id из @username или упоминания"""
+    """Извлекает user_id из @username"""
     if not text:
         return None
-    # Убираем @
     username = text.replace("@", "").strip()
+    
+    # Проверяем в таблице users
+    user_id = db.get_user_by_username(username)
+    if user_id:
+        return user_id
+    
+    # Проверяем в таблице admins
     admin = db.get_admin_by_username(username)
     if admin:
         return admin[0]
+    
     return None
 
 def get_main_menu_keyboard(user_id: int):
@@ -428,6 +463,13 @@ def get_admin_appeal_keyboard(appeal_id: int, is_taken: bool = False):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🤝 Взять обращение", callback_data=f"take_appeal_{appeal_id}")],
         [InlineKeyboardButton("ℹ️ Информация", callback_data=f"appeal_info_{appeal_id}")]
+    ])
+
+def get_mailing_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Рассылка всем", callback_data="mailing_all")],
+        [InlineKeyboardButton("👑 Администраторам", callback_data="mailing_admins")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -620,7 +662,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if f"appeal_{appeal_id}_admin" in context.bot_data:
             del context.bot_data[f"appeal_{appeal_id}_admin"]
 
-        # Предлагаем оставить отзыв
         try:
             await context.bot.send_message(
                 appeal[1],
@@ -687,6 +728,91 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_REVIEW_TEXT
 
+    elif data == "mailing_menu":
+        if not db.has_permission(user_id, "mailing"):
+            await query.answer("❌ Нет доступа к рассылке!", show_alert=True)
+            return
+        await query.edit_message_text(
+            "📨 *Меню рассылки*\nВыберите тип рассылки:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_mailing_menu_keyboard()
+        )
+
+    elif data in ["mailing_all", "mailing_admins"]:
+        if not db.has_permission(user_id, "mailing"):
+            await query.answer("❌ Нет доступа к рассылке!", show_alert=True)
+            return
+
+        context.user_data['mailing_type'] = data
+        await query.edit_message_text(
+            "📝 Отправьте сообщение для рассылки (текст, фото, видео):\n"
+            "Для отмены нажмите кнопку ниже.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel_mailing")
+            ]])
+        )
+        return WAITING_MAILING_MESSAGE
+
+    elif data == "cancel_mailing":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "❌ Рассылка отменена.",
+            reply_markup=get_main_menu_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    elif data == "confirm_mailing":
+        if 'mailing_message' not in context.user_data:
+            await query.edit_message_text("❌ Ошибка! Сообщение не найдено.")
+            return ConversationHandler.END
+
+        mailing_type = context.user_data.get('mailing_type', 'mailing_all')
+        message_data = context.user_data['mailing_message']
+
+        success = 0
+        failed = 0
+
+        if mailing_type == "mailing_all":
+            users = db.get_all_users()
+        else:
+            admins = db.get_all_admins()
+            users = [(admin[0],) for admin in admins]
+
+        for user in users:
+            try:
+                if message_data.get('type') == 'text':
+                    await context.bot.send_message(
+                        user[0],
+                        message_data['text'],
+                        parse_mode=ParseMode.MARKDOWN if message_data.get('parse_mode') else None
+                    )
+                elif message_data.get('type') == 'photo':
+                    await context.bot.send_photo(
+                        user[0],
+                        message_data['file_id'],
+                        caption=message_data.get('caption'),
+                        parse_mode=ParseMode.MARKDOWN if message_data.get('parse_mode') else None
+                    )
+                elif message_data.get('type') == 'video':
+                    await context.bot.send_video(
+                        user[0],
+                        message_data['file_id'],
+                        caption=message_data.get('caption'),
+                        parse_mode=ParseMode.MARKDOWN if message_data.get('parse_mode') else None
+                    )
+                success += 1
+            except Exception as e:
+                logger.error(f"Failed to send to {user[0]}: {e}")
+                failed += 1
+
+        await query.edit_message_text(
+            f"✅ Рассылка завершена!\n\n"
+            f"Успешно: {success}\n"
+            f"Не удалось: {failed}"
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message
@@ -717,7 +843,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         context.user_data.clear()
 
-        # Отправка в чат отзывов
         if REVIEWS_CHAT_ID:
             category_names = {"chat": "Общение", "support": "Поддержка", "other": "Другой вопрос"}
             admin_info = ""
@@ -809,7 +934,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Failed to forward to admin {appeal[6]}: {e}")
 
             await message.reply_text("✅ Сообщение отправлено.")
-
         return
 
     # Ответ админа на обращение
@@ -844,6 +968,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     await message.reply_text(f"❌ Ошибка: {e}")
             return
+
+async def handle_mailing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.has_permission(user_id, "mailing"):
+        await update.message.reply_text("❌ Нет доступа к рассылке!")
+        return ConversationHandler.END
+
+    message = update.message
+    message_data = {
+        'type': 'text',
+        'text': message.text,
+        'parse_mode': True
+    }
+
+    if message.photo:
+        message_data = {
+            'type': 'photo',
+            'file_id': message.photo[-1].file_id,
+            'caption': message.caption,
+            'parse_mode': True
+        }
+    elif message.video:
+        message_data = {
+            'type': 'video',
+            'file_id': message.video.file_id,
+            'caption': message.caption,
+            'parse_mode': True
+        }
+
+    context.user_data['mailing_message'] = message_data
+
+    preview_text = "📨 *Предпросмотр рассылки*\n\n"
+    if message_data['type'] == 'text':
+        preview_text += message_data['text'][:500]
+    else:
+        preview_text += f"[{message_data['type'].upper()}] {message_data.get('caption', 'Без подписи')[:500]}"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_mailing")],
+        [InlineKeyboardButton("✏️ Изменить", callback_data="edit_mailing")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_mailing")]
+    ])
+
+    await message.reply_text(
+        preview_text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard
+    )
+
+    return WAITING_MAILING_CONFIRM
 
 async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -887,6 +1062,59 @@ async def staff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+@owner_required
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    target_user_id = None
+    target_username = None
+    display_name = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+        display_name = " ".join(args) if args else update.message.reply_to_message.from_user.first_name
+    elif len(args) >= 2:
+        target_username = args[0].replace("@", "")
+        display_name = " ".join(args[1:])
+        target_user_id = extract_user_id(args[0])
+    else:
+        await update.message.reply_text("❌ Использование: /addadmin @username Имя")
+        return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Пользователь не найден! Попросите его сначала запустить бота (/start).")
+        return
+
+    db.add_admin(target_user_id, target_username or "", display_name, ["all"], update.effective_user.id)
+    await update.message.reply_text(f"✅ Администратор @{target_username} добавлен с правами [all]!")
+
+@owner_required
+async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    target_user_id = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif args:
+        target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
+    else:
+        await update.message.reply_text("❌ Использование: /deladmin @username")
+        return
+
+    if target_user_id == OWNER_ID:
+        await update.message.reply_text("❌ Нельзя удалить владельца!")
+        return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Администратор не найден!")
+        return
+
+    db.remove_admin(target_user_id)
+    await update.message.reply_text(f"✅ Администратор @{target_username} удален!")
+
 async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -902,8 +1130,8 @@ async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_user_id = update.message.reply_to_message.from_user.id
         target_username = update.message.reply_to_message.from_user.username
     elif args:
-        target_user_id = extract_user_id(args[0])
         target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
 
     if not target_user_id:
         await update.message.reply_text("❌ Укажите пользователя через @username или ответ на сообщение!")
@@ -955,13 +1183,16 @@ async def setdj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     target_user_id = None
+    target_username = None
     
     if update.message.reply_to_message:
         target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
         position = " ".join(args) if args else "Администратор"
     elif len(args) >= 2:
-        target_user_id = extract_user_id(args[0])
+        target_username = args[0].replace("@", "")
         position = " ".join(args[1:])
+        target_user_id = extract_user_id(args[0])
     else:
         await update.message.reply_text("❌ Использование: /setdj @username Должность")
         return
@@ -970,8 +1201,12 @@ async def setdj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пользователь не найден!")
         return
 
-    db.update_admin_position(target_user_id, position)
     admin = db.get_admin(target_user_id)
+    if not admin:
+        await update.message.reply_text("❌ Этот пользователь не администратор!")
+        return
+
+    db.update_admin_position(target_user_id, position)
     
     await update.message.reply_text(
         f"✅ Должность для @{admin[1]} изменена на: *{position}*",
@@ -1007,6 +1242,10 @@ async def sysban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пользователь не найден!")
         return
 
+    if target_user_id == OWNER_ID:
+        await update.message.reply_text("❌ Нельзя забанить владельца!")
+        return
+
     ban_type = "temp"
     until = None
     reason = "Не указана"
@@ -1031,6 +1270,244 @@ async def sysban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 Причина: {reason}",
         parse_mode=ParseMode.MARKDOWN
     )
+
+async def sysunban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.has_permission(user_id, "sysban"):
+        await update.message.reply_text("❌ У вас нет права sysban!")
+        return
+
+    args = context.args
+    target_user_id = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif args:
+        target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
+    else:
+        await update.message.reply_text("❌ Использование: /sysunban @username")
+        return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Пользователь не найден!")
+        return
+
+    db.unban_user(target_user_id)
+    await update.message.reply_text(f"✅ Пользователь @{target_username} разблокирован!")
+
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.has_permission(user_id, "mute"):
+        await update.message.reply_text("❌ У вас нет права mute!")
+        return
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "❌ *Использование:*\n"
+            "`/mute @username 1h причина` — мут на время",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    target_user_id = None
+    target_username = args[0].replace("@", "")
+    
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+    else:
+        target_user_id = extract_user_id(args[0])
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Пользователь не найден!")
+        return
+
+    if target_user_id == OWNER_ID:
+        await update.message.reply_text("❌ Нельзя замутить владельца!")
+        return
+
+    until = parse_time(args[1])
+    if not until:
+        await update.message.reply_text("❌ Неверный формат времени! Пример: 1h, 2d, 30m")
+        return
+
+    reason = " ".join(args[2:]) if len(args) > 2 else "Не указана"
+
+    db.mute_user(target_user_id, until, reason)
+
+    await update.message.reply_text(
+        f"🔇 *Пользователь замучен!*\n\n"
+        f"👤 @{target_username}\n"
+        f"⏰ До: {until.strftime('%d.%m.%Y %H:%M')}\n"
+        f"📝 Причина: {reason}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.has_permission(user_id, "mute"):
+        await update.message.reply_text("❌ У вас нет права mute!")
+        return
+
+    args = context.args
+    target_user_id = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif args:
+        target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
+    else:
+        await update.message.reply_text("❌ Использование: /unmute @username")
+        return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Пользователь не найден!")
+        return
+
+    db.unmute_user(target_user_id)
+    await update.message.reply_text(f"🔊 Пользователь @{target_username} размучен!")
+
+async def getadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.has_permission(user_id, "get_stats"):
+        await update.message.reply_text("❌ У вас нет права get_stats!")
+        return
+
+    args = context.args
+    target_user_id = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif args:
+        target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
+    else:
+        await update.message.reply_text("❌ Использование: /getadmin @username")
+        return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Пользователь не найден!")
+        return
+
+    appeal_ids = db.get_today_user_appeals(target_user_id)
+    appeals_count = len(appeal_ids)
+
+    await update.message.reply_text(
+        f"📊 *Статистика за сегодня для @{target_username}*\n\n"
+        f"📨 Обращений: {appeals_count}\n"
+        f"🆔 ID обращений: {', '.join(map(str, appeal_ids)) if appeal_ids else 'Нет'}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def level_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.has_permission(user_id, "manage_admins"):
+        await update.message.reply_text("❌ У вас нет прав!")
+        return
+
+    args = context.args
+    target_user_id = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif args:
+        target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
+    else:
+        await update.message.reply_text("❌ Использование: /level_up @username")
+        return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Пользователь не найден!")
+        return
+
+    admin = db.get_admin(target_user_id)
+    if not admin:
+        await update.message.reply_text("❌ Это не администратор!")
+        return
+
+    new_level = admin[5] + 1
+    db.update_admin_level(target_user_id, new_level)
+
+    if ADMIN_CHAT_ID:
+        message = f"""
+🎉 *Повышение!*
+
+{admin[3]} *{admin[2]}* (@{admin[1]}) получил повышение!
+🌟 Новый уровень: {new_level}
+
+Поздравляем! 🎊
+        """
+        try:
+            await context.bot.send_message(ADMIN_CHAT_ID, message, parse_mode=ParseMode.MARKDOWN)
+        except:
+            pass
+
+    await update.message.reply_text(f"✅ Уровень @{target_username} повышен до {new_level}!")
+
+async def level_down_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.has_permission(user_id, "manage_admins"):
+        await update.message.reply_text("❌ У вас нет прав!")
+        return
+
+    args = context.args
+    target_user_id = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif args:
+        target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
+    else:
+        await update.message.reply_text("❌ Использование: /level_down @username")
+        return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Пользователь не найден!")
+        return
+
+    admin = db.get_admin(target_user_id)
+    if not admin:
+        await update.message.reply_text("❌ Это не администратор!")
+        return
+
+    new_level = max(1, admin[5] - 1)
+    db.update_admin_level(target_user_id, new_level)
+
+    if ADMIN_CHAT_ID:
+        message = f"""
+📉 *Понижение*
+
+{admin[3]} *{admin[2]}* (@{admin[1]}) понижен в уровне.
+📊 Новый уровень: {new_level}
+
+Надеемся на улучшение! 💪
+        """
+        try:
+            await context.bot.send_message(ADMIN_CHAT_ID, message, parse_mode=ParseMode.MARKDOWN)
+        except:
+            pass
+
+    await update.message.reply_text(f"✅ Уровень @{target_username} понижен до {new_level}!")
 
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1118,18 +1595,18 @@ async def handle_prefix_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     target_id = context.user_data['setting_prefix_for']
-    new_prefix = update.message.text.strip()[:10]  # Ограничиваем длину
+    new_prefix = update.message.text.strip()[:10]
 
     db.update_admin_prefix(target_id, new_prefix)
     del context.user_data['setting_prefix_for']
 
     await update.message.reply_text(
-        f"✅ Префикс изменён на: {new_prefix}",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔙 К настройкам", callback_data="back_to_settings")
-        ]])
+        f"✅ Префикс изменён на: {new_prefix}"
     )
     return ConversationHandler.END
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Update {update} caused error {context.error}")
 
 def main():
     application = Application.builder().token(TOKEN).build()
@@ -1138,13 +1615,37 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reports", reports_command))
     application.add_handler(CommandHandler("staffa", staff_command))
+    application.add_handler(CommandHandler("addadmin", addadmin_command))
+    application.add_handler(CommandHandler("deladmin", deladmin_command))
     application.add_handler(CommandHandler("admin_set", admin_set_command))
     application.add_handler(CommandHandler("setdj", setdj_command))
     application.add_handler(CommandHandler("sysban", sysban_command))
+    application.add_handler(CommandHandler("sysunban", sysunban_command))
+    application.add_handler(CommandHandler("mute", mute_command))
+    application.add_handler(CommandHandler("unmute", unmute_command))
+    application.add_handler(CommandHandler("getadmin", getadmin_command))
+    application.add_handler(CommandHandler("level_up", level_up_command))
+    application.add_handler(CommandHandler("level_down", level_down_command))
 
     # Callback обработчики
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^(?!setperm_|setprefix_|saveperms_|cancelprefix_).*"))
     application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(setperm_|setprefix_|saveperms_|cancelprefix_).*"))
+
+    # Conversation для рассылки
+    mailing_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern="^mailing_")],
+        states={
+            WAITING_MAILING_MESSAGE: [
+                MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO, handle_mailing_message),
+                CallbackQueryHandler(button_handler, pattern="^cancel_mailing$")
+            ],
+            WAITING_MAILING_CONFIRM: [
+                CallbackQueryHandler(button_handler, pattern="^(confirm_mailing|edit_mailing|cancel_mailing)$")
+            ],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+    application.add_handler(mailing_conv)
 
     # Conversation для префикса
     prefix_conv = ConversationHandler(
@@ -1161,6 +1662,8 @@ def main():
         filters.TEXT | filters.PHOTO | filters.VIDEO & ~filters.COMMAND,
         handle_message
     ))
+
+    application.add_error_handler(error_handler)
 
     print("✨ Бот 'Сияние Неба' запущен...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
