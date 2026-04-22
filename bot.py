@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Константы
 TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_USERNAME = "anti_p0v"  # Владелец по юзернейму
+OWNER_ID = None  # Будет определено при запуске
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/your_channel")
 REVIEWS_CHAT_ID = int(os.getenv("REVIEWS_CHAT_ID", "0"))
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
@@ -40,10 +41,6 @@ BOT_REVIEWS_LINK = os.getenv("BOT_REVIEWS_LINK", "https://t.me/bot_reviews")
 WAITING_MAILING_MESSAGE = 1
 WAITING_MAILING_CONFIRM = 2
 WAITING_REVIEW_TEXT = 6
-WAITING_MUTE_CATEGORY = 8
-WAITING_MUTE_TIME = 9
-WAITING_MUTE_REASON = 10
-WAITING_APPEAL_REPLY = 11
 
 class Database:
     def __init__(self, db_path="bot.db"):
@@ -154,14 +151,15 @@ class Database:
                 messages_sent INTEGER DEFAULT 0
             )
         ''')
-
-        # Автоматически добавляем владельца как админа
-        if OWNER_ID:
-            self.cursor.execute('''
-                INSERT OR IGNORE INTO admins (user_id, username, display_name, position, level, permissions, departments)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (OWNER_ID, 'owner', 'Владелец', '👑 Создатель', 99, '["all"]', '["chat", "support", "other"]'))
         
+        self.conn.commit()
+
+    def set_owner(self, user_id: int, username: str):
+        """Добавляет владельца при первом запуске"""
+        self.cursor.execute('''
+            INSERT OR IGNORE INTO admins (user_id, username, display_name, position, level, permissions, departments)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, 'Владелец', '👑 Создатель', 5, '["all"]', '["chat", "support", "other"]'))
         self.conn.commit()
 
     def add_user(self, user_id: int, username: str, first_name: str, last_name: str = ""):
@@ -170,6 +168,12 @@ class Database:
             VALUES (?, ?, ?, ?)
         ''', (user_id, username, first_name, last_name))
         self.conn.commit()
+        
+        # Если это владелец, добавляем его как админа
+        global OWNER_ID
+        if username and username.lower() == OWNER_USERNAME.lower():
+            OWNER_ID = user_id
+            self.set_owner(user_id, username)
 
     def get_user_by_username(self, username: str) -> Optional[int]:
         self.cursor.execute('SELECT user_id FROM users WHERE username = ?', (username,))
@@ -233,11 +237,11 @@ class Database:
         self.cursor.execute('UPDATE users SET is_muted = 0, mute_until = NULL, mute_category = NULL WHERE user_id = ?', (user_id,))
         self.conn.commit()
 
-    def add_admin(self, user_id: int, username: str, display_name: str, permissions: list, added_by: int):
+    def add_admin(self, user_id: int, username: str, display_name: str, added_by: int):
         self.cursor.execute('''
-            INSERT OR REPLACE INTO admins (user_id, username, display_name, permissions, added_by)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, username, display_name, json.dumps(permissions), added_by))
+            INSERT OR REPLACE INTO admins (user_id, username, display_name, added_by)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, username, display_name, added_by))
         self.conn.commit()
 
     def remove_admin(self, user_id: int):
@@ -253,31 +257,33 @@ class Database:
         return self.cursor.fetchone()
 
     def is_admin(self, user_id: int) -> bool:
-        if user_id == OWNER_ID:
+        if OWNER_ID and user_id == OWNER_ID:
             return True
         self.cursor.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,))
         return self.cursor.fetchone() is not None
 
     def get_admin_permissions(self, user_id: int) -> list:
-        if user_id == OWNER_ID:
+        if OWNER_ID and user_id == OWNER_ID:
             return ["all"]
         self.cursor.execute('SELECT permissions FROM admins WHERE user_id = ?', (user_id,))
         result = self.cursor.fetchone()
         if result:
-            return json.loads(result[0])
+            perms = json.loads(result[0])
+            return perms if perms else []
         return []
 
     def get_admin_departments(self, user_id: int) -> list:
-        if user_id == OWNER_ID:
+        if OWNER_ID and user_id == OWNER_ID:
             return ["chat", "support", "other"]
         self.cursor.execute('SELECT departments FROM admins WHERE user_id = ?', (user_id,))
         result = self.cursor.fetchone()
         if result:
-            return json.loads(result[0])
+            depts = json.loads(result[0])
+            return depts if depts else ["chat", "support", "other"]
         return ["chat", "support", "other"]
 
     def has_permission(self, user_id: int, permission: str) -> bool:
-        if user_id == OWNER_ID:
+        if OWNER_ID and user_id == OWNER_ID:
             return True
         perms = self.get_admin_permissions(user_id)
         return "all" in perms or permission in perms
@@ -403,7 +409,7 @@ db = Database()
 def owner_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
-        if user_id != OWNER_ID:
+        if not OWNER_ID or user_id != OWNER_ID:
             await update.message.reply_text("❌ Эта команда только для владельца!")
             return
         return await func(update, context, *args, **kwargs)
@@ -517,7 +523,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Решение технических вопросов
 • Приятное общение
 
-Версия: 3.0.0
+Версия: 4.0.0
         """
         await query.edit_message_text(
             info_text,
@@ -614,7 +620,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Обращение не найдено!", show_alert=True)
             return
 
-        # Проверяем доступ к отделу
         admin_depts = db.get_admin_departments(user_id)
         if appeal[4] not in admin_depts and "all" not in admin_depts:
             await query.answer(f"❌ У вас нет доступа к отделу '{appeal[4]}'!", show_alert=True)
@@ -864,7 +869,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("🔇 У вас ограничена возможность писать запросы.")
         return
 
-    # Обработка отзыва
     if context.user_data.get('waiting_for_review'):
         review_text = message.text or "Без текста"
         appeal_id = context.user_data.get('review_appeal_id')
@@ -910,7 +914,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Обработка обращения
     if context.user_data.get('waiting_for_appeal'):
         appeal_id = context.user_data.get('appeal_id')
 
@@ -925,7 +928,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return
 
-        # Сохраняем сообщение
         msg_text = message.text or message.caption or ""
         msg_type = "text"
         file_id = None
@@ -994,7 +996,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("✅ Сообщение отправлено.")
         return
 
-    # Ответ админа на обращение
     reply_to_id = context.bot_data.get(f"reply_to_{user.id}")
     if reply_to_id:
         appeal_id = reply_to_id
@@ -1147,8 +1148,9 @@ async def staff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rating = admin[5] if admin[5] else 5.0
         rating_stars = "⭐" * int(rating)
         reviews_count = admin[6] if admin[6] else 0
+        level_stars = "🔰" * admin[4]
         text += f"*{admin[2]}* — {admin[3]}\n"
-        text += f"├ Уровень: {admin[4]} | Рейтинг: {rating_stars} ({rating:.1f}) | Отзывов: {reviews_count}\n"
+        text += f"├ {level_stars} Уровень {admin[4]} | {rating_stars} ({rating:.1f}) | 📝 {reviews_count}\n"
         text += f"└ @{admin[1]}\n\n"
 
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -1176,8 +1178,8 @@ async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пользователь не найден! Попросите его сначала запустить бота (/start).")
         return
 
-    db.add_admin(target_user_id, target_username or "", display_name, [], update.effective_user.id)
-    await update.message.reply_text(f"✅ Администратор @{target_username} добавлен! Права можно настроить через /admin_set")
+    db.add_admin(target_user_id, target_username or "", display_name, update.effective_user.id)
+    await update.message.reply_text(f"✅ Администратор @{target_username} добавлен!\nИспользуйте /admin_set для настройки прав.")
 
 @owner_required
 async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1195,7 +1197,7 @@ async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Использование: /deladmin @username")
         return
 
-    if target_user_id == OWNER_ID:
+    if OWNER_ID and target_user_id == OWNER_ID:
         await update.message.reply_text("❌ Нельзя удалить владельца!")
         return
 
@@ -1209,7 +1211,7 @@ async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
+    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
         await update.message.reply_text("❌ У вас нет прав для этой команды!")
         return
 
@@ -1241,7 +1243,6 @@ async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = []
     
-    # Права
     perm_names = {
         "manage_admins": "Управление админами",
         "sysban": "Системные баны",
@@ -1256,7 +1257,6 @@ async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             callback_data=f"setperm_{target_user_id}_{perm}"
         )])
     
-    # Отделы
     dept_names = {"chat": "💬 Общение", "support": "🛟 Поддержка", "other": "❓ Другое"}
     for dept in all_depts:
         status = "✅" if dept in depts else "❌"
@@ -1278,7 +1278,7 @@ async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setdj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
+    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
         await update.message.reply_text("❌ У вас нет прав!")
         return
 
@@ -1343,7 +1343,7 @@ async def sysban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пользователь не найден!")
         return
 
-    if target_user_id == OWNER_ID:
+    if OWNER_ID and target_user_id == OWNER_ID:
         await update.message.reply_text("❌ Нельзя забанить владельца!")
         return
 
@@ -1435,7 +1435,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пользователь не найден!")
         return
 
-    if target_user_id == OWNER_ID:
+    if OWNER_ID and target_user_id == OWNER_ID:
         await update.message.reply_text("❌ Нельзя замутить владельца!")
         return
 
@@ -1489,8 +1489,8 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def getadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not db.has_permission(user_id, "get_stats") and user_id != OWNER_ID:
-        await update.message.reply_text("❌ У вас нет права get_stats!")
+    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+        await update.message.reply_text("❌ У вас нет прав!")
         return
 
     args = context.args
@@ -1598,7 +1598,7 @@ async def infoticket_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def level_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
+    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
         await update.message.reply_text("❌ У вас нет прав!")
         return
 
@@ -1636,7 +1636,7 @@ async def level_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Это не администратор!")
         return
 
-    new_level = admin[4] + level_increase
+    new_level = min(5, admin[4] + level_increase)
     db.update_admin_level(target_user_id, new_level)
 
     if ADMIN_CHAT_ID:
@@ -1658,7 +1658,7 @@ async def level_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def level_down_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
+    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
         await update.message.reply_text("❌ У вас нет прав!")
         return
 
@@ -1726,7 +1726,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         target_id = int(parts[1])
         perm = "_".join(parts[2:])
 
-        if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
+        if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
             await query.answer("❌ Нет прав!", show_alert=True)
             return
 
@@ -1783,7 +1783,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         target_id = int(parts[1])
         dept = parts[2]
 
-        if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
+        if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
             await query.answer("❌ Нет прав!", show_alert=True)
             return
 
@@ -1840,7 +1840,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(TOKEN).build()
 
-    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reports", reports_command))
     application.add_handler(CommandHandler("staffa", staff_command))
@@ -1857,11 +1856,9 @@ def main():
     application.add_handler(CommandHandler("level_up", level_up_command))
     application.add_handler(CommandHandler("level_down", level_down_command))
 
-    # Callback обработчики
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^(?!setperm_|setdept_|saveperms_).*"))
     application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(setperm_|setdept_|saveperms_).*"))
 
-    # Conversation для рассылки
     mailing_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^mailing_")],
         states={
@@ -1877,7 +1874,6 @@ def main():
     )
     application.add_handler(mailing_conv)
 
-    # Обработчик сообщений
     application.add_handler(MessageHandler(
         filters.TEXT | filters.PHOTO | filters.VIDEO & ~filters.COMMAND,
         handle_message
@@ -1886,6 +1882,7 @@ def main():
     application.add_error_handler(error_handler)
 
     print("✨ Бот 'Сияние Неба' запущен...")
+    print(f"👑 Владелец: @{OWNER_USERNAME}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
