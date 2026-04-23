@@ -18,6 +18,7 @@ from telegram.constants import ParseMode
 import sqlite3
 import json
 import re
+import random
 
 load_dotenv()
 
@@ -30,8 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Константы
 TOKEN = os.getenv("BOT_TOKEN")
-OWNER_USERNAME = "anti_p0v"  # Владелец по юзернейму
-OWNER_ID = None  # Будет определено при запуске
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/your_channel")
 REVIEWS_CHAT_ID = int(os.getenv("REVIEWS_CHAT_ID", "0"))
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
@@ -42,6 +42,20 @@ WAITING_MAILING_MESSAGE = 1
 WAITING_MAILING_CONFIRM = 2
 WAITING_REVIEW_TEXT = 6
 
+# Мотивирующие фразы для повышения
+LEVEL_UP_MESSAGES = [
+    "🌟 Ты растёшь! Твоя работа замечена и оценена по достоинству!",
+    "💪 Отличная работа! Ты становишься сильнее с каждым днём!",
+    "🚀 Твои усилия приносят плоды! Продолжай в том же духе!",
+    "⭐ Ты превзошёл ожидания! Сияние Неба гордится тобой!",
+    "🔥 Твоя преданность делу вдохновляет! Так держать!",
+    "💎 Ты — настоящая находка для команды! Блестящая работа!",
+    "🎯 Ты точно идёшь к цели! Уверенный шаг вперёд!",
+    "🏆 Ты достигаешь новых высот! Команда ценит тебя!",
+    "🌈 Твой труд делает мир светлее! Продолжай сиять!",
+    "🦅 Ты паришь над задачами! Впечатляющий прогресс!",
+]
+
 class Database:
     def __init__(self, db_path="bot.db"):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -49,7 +63,6 @@ class Database:
         self.init_tables()
 
     def init_tables(self):
-        # Пользователи
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -65,7 +78,6 @@ class Database:
             )
         ''')
 
-        # Администраторы
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -82,7 +94,6 @@ class Database:
             )
         ''')
 
-        # Обращения
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS appeals (
                 appeal_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,7 +109,6 @@ class Database:
             )
         ''')
 
-        # Сообщения обращений
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS appeal_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +122,6 @@ class Database:
             )
         ''')
 
-        # Отзывы
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +137,6 @@ class Database:
             )
         ''')
 
-        # Системные баны
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS sys_bans (
                 user_id INTEGER PRIMARY KEY,
@@ -141,7 +149,6 @@ class Database:
             )
         ''')
 
-        # Статистика
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS daily_stats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,15 +158,7 @@ class Database:
                 messages_sent INTEGER DEFAULT 0
             )
         ''')
-        
-        self.conn.commit()
 
-    def set_owner(self, user_id: int, username: str):
-        """Добавляет владельца при первом запуске"""
-        self.cursor.execute('''
-            INSERT OR IGNORE INTO admins (user_id, username, display_name, position, level, permissions, departments)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, username, 'Владелец', '👑 Создатель', 5, '["all"]', '["chat", "support", "other"]'))
         self.conn.commit()
 
     def add_user(self, user_id: int, username: str, first_name: str, last_name: str = ""):
@@ -168,12 +167,6 @@ class Database:
             VALUES (?, ?, ?, ?)
         ''', (user_id, username, first_name, last_name))
         self.conn.commit()
-        
-        # Если это владелец, добавляем его как админа
-        global OWNER_ID
-        if username and username.lower() == OWNER_USERNAME.lower():
-            OWNER_ID = user_id
-            self.set_owner(user_id, username)
 
     def get_user_by_username(self, username: str) -> Optional[int]:
         self.cursor.execute('SELECT user_id FROM users WHERE username = ?', (username,))
@@ -215,7 +208,6 @@ class Database:
             INSERT OR REPLACE INTO sys_bans (user_id, username, reason, ban_type, banned_until, banned_by)
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (user_id, username, reason, ban_type, until.isoformat() if until else None, banned_by))
-
         if ban_type == "full":
             self.cursor.execute('UPDATE users SET is_banned = 1, ban_until = NULL WHERE user_id = ?', (user_id,))
         else:
@@ -257,13 +249,13 @@ class Database:
         return self.cursor.fetchone()
 
     def is_admin(self, user_id: int) -> bool:
-        if OWNER_ID and user_id == OWNER_ID:
+        if user_id == OWNER_ID:
             return True
         self.cursor.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,))
         return self.cursor.fetchone() is not None
 
     def get_admin_permissions(self, user_id: int) -> list:
-        if OWNER_ID and user_id == OWNER_ID:
+        if user_id == OWNER_ID:
             return ["all"]
         self.cursor.execute('SELECT permissions FROM admins WHERE user_id = ?', (user_id,))
         result = self.cursor.fetchone()
@@ -273,7 +265,7 @@ class Database:
         return []
 
     def get_admin_departments(self, user_id: int) -> list:
-        if OWNER_ID and user_id == OWNER_ID:
+        if user_id == OWNER_ID:
             return ["chat", "support", "other"]
         self.cursor.execute('SELECT departments FROM admins WHERE user_id = ?', (user_id,))
         result = self.cursor.fetchone()
@@ -283,7 +275,7 @@ class Database:
         return ["chat", "support", "other"]
 
     def has_permission(self, user_id: int, permission: str) -> bool:
-        if OWNER_ID and user_id == OWNER_ID:
+        if user_id == OWNER_ID:
             return True
         perms = self.get_admin_permissions(user_id)
         return "all" in perms or permission in perms
@@ -306,6 +298,11 @@ class Database:
 
     def update_admin_departments(self, user_id: int, departments: list):
         self.cursor.execute('UPDATE admins SET departments = ? WHERE user_id = ?', (json.dumps(departments), user_id))
+        self.conn.commit()
+
+    def set_admin_full_perms(self, user_id: int):
+        self.cursor.execute('UPDATE admins SET permissions = ?, departments = ?, level = 5 WHERE user_id = ?',
+                          (json.dumps(["all"]), json.dumps(["chat", "support", "other"]), user_id))
         self.conn.commit()
 
     def create_appeal(self, user_id: int, username: str, first_name: str, category: str) -> int:
@@ -370,7 +367,6 @@ class Database:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', (user_id, username, display_name, is_anonymous, category, admin_id, rating, text))
         self.conn.commit()
-        
         if admin_id:
             self.cursor.execute('''
                 SELECT AVG(rating), COUNT(*) FROM reviews WHERE admin_id = ?
@@ -387,7 +383,6 @@ class Database:
             INSERT OR IGNORE INTO daily_stats (admin_id, date, appeals_taken, messages_sent)
             VALUES (?, ?, 0, 0)
         ''', (admin_id, today))
-
         if stat_type == "appeal":
             self.cursor.execute('''
                 UPDATE daily_stats SET appeals_taken = appeals_taken + 1
@@ -409,7 +404,7 @@ db = Database()
 def owner_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id
-        if not OWNER_ID or user_id != OWNER_ID:
+        if user_id != OWNER_ID:
             await update.message.reply_text("❌ Эта команда только для владельца!")
             return
         return await func(update, context, *args, **kwargs)
@@ -433,15 +428,12 @@ def extract_user_id(text: str) -> Optional[int]:
     if not text:
         return None
     username = text.replace("@", "").strip()
-    
     user_id = db.get_user_by_username(username)
     if user_id:
         return user_id
-    
     admin = db.get_admin_by_username(username)
     if admin:
         return admin[0]
-    
     return None
 
 def get_main_menu_keyboard(user_id: int):
@@ -523,7 +515,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Решение технических вопросов
 • Приятное общение
 
-Версия: 4.0.0
+Версия: 5.0.0
         """
         await query.edit_message_text(
             info_text,
@@ -1156,6 +1148,39 @@ async def staff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 @owner_required
+async def sysadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    target_user_id = None
+    target_username = None
+
+    if update.message.reply_to_message:
+        target_user_id = update.message.reply_to_message.from_user.id
+        target_username = update.message.reply_to_message.from_user.username
+    elif args:
+        target_username = args[0].replace("@", "")
+        target_user_id = extract_user_id(args[0])
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Укажите пользователя через @username или ответ на сообщение!")
+        return
+
+    admin = db.get_admin(target_user_id)
+    if not admin:
+        await update.message.reply_text("❌ Этот пользователь не администратор!")
+        return
+
+    db.set_admin_full_perms(target_user_id)
+    
+    await update.message.reply_text(
+        f"✅ *Администратор @{admin[1]} получил полные права!*\n\n"
+        f"👤 Имя: {admin[2]}\n"
+        f"📊 Уровень: 5\n"
+        f"🔐 Права: Все права\n"
+        f"📂 Отделы: Все отделы",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@owner_required
 async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     target_user_id = None
@@ -1179,7 +1204,7 @@ async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     db.add_admin(target_user_id, target_username or "", display_name, update.effective_user.id)
-    await update.message.reply_text(f"✅ Администратор @{target_username} добавлен!\nИспользуйте /admin_set для настройки прав.")
+    await update.message.reply_text(f"✅ Администратор @{target_username} добавлен!\nИспользуйте /admin_set для настройки прав или /sysadmin для выдачи полных прав.")
 
 @owner_required
 async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1197,7 +1222,7 @@ async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Использование: /deladmin @username")
         return
 
-    if OWNER_ID and target_user_id == OWNER_ID:
+    if target_user_id == OWNER_ID:
         await update.message.reply_text("❌ Нельзя удалить владельца!")
         return
 
@@ -1211,7 +1236,7 @@ async def deladmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
         await update.message.reply_text("❌ У вас нет прав для этой команды!")
         return
 
@@ -1278,7 +1303,7 @@ async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setdj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
         await update.message.reply_text("❌ У вас нет прав!")
         return
 
@@ -1343,7 +1368,7 @@ async def sysban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пользователь не найден!")
         return
 
-    if OWNER_ID and target_user_id == OWNER_ID:
+    if target_user_id == OWNER_ID:
         await update.message.reply_text("❌ Нельзя забанить владельца!")
         return
 
@@ -1435,7 +1460,7 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пользователь не найден!")
         return
 
-    if OWNER_ID and target_user_id == OWNER_ID:
+    if target_user_id == OWNER_ID:
         await update.message.reply_text("❌ Нельзя замутить владельца!")
         return
 
@@ -1489,7 +1514,7 @@ async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def getadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
         await update.message.reply_text("❌ У вас нет прав!")
         return
 
@@ -1598,7 +1623,7 @@ async def infoticket_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def level_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
         await update.message.reply_text("❌ У вас нет прав!")
         return
 
@@ -1638,13 +1663,18 @@ async def level_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_level = min(5, admin[4] + level_increase)
     db.update_admin_level(target_user_id, new_level)
+    
+    motivation = random.choice(LEVEL_UP_MESSAGES)
 
     if ADMIN_CHAT_ID:
         message = f"""
 🎉 *Повышение!*
 
-*{admin[2]}* (@{admin[1]}) получил повышение!
+{admin[3]} *{admin[2]}* (@{admin[1]}) получил повышение!
 🌟 Новый уровень: {new_level} (+{level_increase})
+
+💬 *Мотивация:*
+_{motivation}_
 
 Поздравляем! 🎊
         """
@@ -1653,12 +1683,18 @@ async def level_up_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    await update.message.reply_text(f"✅ Уровень @{target_username} повышен на {level_increase} до {new_level}!")
+    await update.message.reply_text(
+        f"🎉 *Повышение!*\n\n"
+        f"👤 @{target_username}\n"
+        f"📈 Уровень повышен на {level_increase} → теперь *{new_level}*\n\n"
+        f"💬 _{motivation}_",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def level_down_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+    if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
         await update.message.reply_text("❌ У вас нет прав!")
         return
 
@@ -1666,25 +1702,28 @@ async def level_down_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     target_user_id = None
     target_username = None
     level_decrease = 1
+    reason = "Не указана"
 
     if update.message.reply_to_message:
         target_user_id = update.message.reply_to_message.from_user.id
         target_username = update.message.reply_to_message.from_user.username
-        if args:
+        if len(args) >= 1:
             try:
                 level_decrease = int(args[0])
+                reason = " ".join(args[1:]) if len(args) > 1 else "Не указана"
             except:
-                pass
+                reason = " ".join(args)
     elif args:
         target_username = args[0].replace("@", "")
         target_user_id = extract_user_id(args[0])
         if len(args) > 1:
             try:
                 level_decrease = int(args[1])
+                reason = " ".join(args[2:]) if len(args) > 2 else "Не указана"
             except:
-                pass
+                reason = " ".join(args[1:])
     else:
-        await update.message.reply_text("❌ Использование: /level_down @username [количество]")
+        await update.message.reply_text("❌ Использование: /level_down @username [количество] [причина]")
         return
 
     if not target_user_id:
@@ -1703,8 +1742,11 @@ async def level_down_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         message = f"""
 📉 *Понижение*
 
-*{admin[2]}* (@{admin[1]}) понижен в уровне.
+{admin[3]} *{admin[2]}* (@{admin[1]}) понижен в уровне.
 📊 Новый уровень: {new_level} (-{level_decrease})
+
+📝 *Причина:*
+_{reason}_
 
 Надеемся на улучшение! 💪
         """
@@ -1713,7 +1755,13 @@ async def level_down_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except:
             pass
 
-    await update.message.reply_text(f"✅ Уровень @{target_username} понижен на {level_decrease} до {new_level}!")
+    await update.message.reply_text(
+        f"📉 *Понижение*\n\n"
+        f"👤 @{target_username}\n"
+        f"📉 Уровень понижен на {level_decrease} → теперь *{new_level}*\n\n"
+        f"📝 *Причина:* _{reason}_",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1726,7 +1774,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         target_id = int(parts[1])
         perm = "_".join(parts[2:])
 
-        if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+        if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
             await query.answer("❌ Нет прав!", show_alert=True)
             return
 
@@ -1783,7 +1831,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         target_id = int(parts[1])
         dept = parts[2]
 
-        if not OWNER_ID or (user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins")):
+        if user_id != OWNER_ID and not db.has_permission(user_id, "manage_admins"):
             await query.answer("❌ Нет прав!", show_alert=True)
             return
 
@@ -1843,6 +1891,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("reports", reports_command))
     application.add_handler(CommandHandler("staffa", staff_command))
+    application.add_handler(CommandHandler("sysadmin", sysadmin_command))
     application.add_handler(CommandHandler("addadmin", addadmin_command))
     application.add_handler(CommandHandler("deladmin", deladmin_command))
     application.add_handler(CommandHandler("admin_set", admin_set_command))
@@ -1882,7 +1931,7 @@ def main():
     application.add_error_handler(error_handler)
 
     print("✨ Бот 'Сияние Неба' запущен...")
-    print(f"👑 Владелец: @{OWNER_USERNAME}")
+    print(f"👑 OWNER_ID: {OWNER_ID}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
