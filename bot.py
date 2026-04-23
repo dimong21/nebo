@@ -40,7 +40,9 @@ BOT_REVIEWS_LINK = os.getenv("BOT_REVIEWS_LINK", "https://t.me/bot_reviews")
 # Состояния
 WAITING_MAILING_MESSAGE = 1
 WAITING_MAILING_CONFIRM = 2
-WAITING_REVIEW_TEXT = 6
+WAITING_REVIEW_TEXT = 3
+WAITING_APPEAL_MESSAGE = 4
+IN_APPEAL_CHAT = 5
 
 # Мотивирующие фразы для повышения
 LEVEL_UP_MESSAGES = [
@@ -451,6 +453,7 @@ def get_main_menu_keyboard(user_id: int):
 def get_admin_appeal_keyboard(appeal_id: int, is_taken: bool = False):
     if is_taken:
         return InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Войти в диалог", callback_data=f"enter_chat_{appeal_id}")],
             [InlineKeyboardButton("ℹ️ Информация", callback_data=f"appeal_info_{appeal_id}")],
             [InlineKeyboardButton("✅ Завершить", callback_data=f"close_appeal_{appeal_id}")]
         ])
@@ -458,6 +461,18 @@ def get_admin_appeal_keyboard(appeal_id: int, is_taken: bool = False):
         [InlineKeyboardButton("🤝 Взять обращение", callback_data=f"take_appeal_{appeal_id}")],
         [InlineKeyboardButton("ℹ️ Информация", callback_data=f"appeal_info_{appeal_id}")]
     ])
+
+def get_user_appeal_keyboard(appeal_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Войти в диалог", callback_data=f"enter_chat_{appeal_id}")],
+        [InlineKeyboardButton("❌ Отменить обращение", callback_data=f"cancel_appeal_{appeal_id}")]
+    ])
+
+def get_exit_chat_keyboard(appeal_id: int, is_admin: bool = False):
+    keyboard = [[InlineKeyboardButton("🚪 Выйти из диалога", callback_data=f"exit_chat_{appeal_id}")]]
+    if is_admin:
+        keyboard.append([InlineKeyboardButton("✅ Завершить обращение", callback_data=f"close_appeal_{appeal_id}")])
+    return InlineKeyboardMarkup(keyboard)
 
 def get_mailing_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -530,10 +545,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if open_appeal:
             await query.edit_message_text(
                 f"🌸 У вас уже есть открытое обращение №{open_appeal[0]}. Ожидайте ответа.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀️ Назад", callback_data="back_to_main"),
-                    InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_appeal_{open_appeal[0]}")
-                ]])
+                reply_markup=get_user_appeal_keyboard(open_appeal[0])
             )
             return
 
@@ -558,42 +570,124 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         appeal_id = db.create_appeal(user_id, query.from_user.username or "", query.from_user.first_name, category)
-        context.user_data['appeal_id'] = appeal_id
-        context.user_data['appeal_category'] = category
+        context.user_data['active_appeal'] = appeal_id
 
         await query.edit_message_text(
             f"✅ *Обращение №{appeal_id} создано!*\n"
             f"🌸 Категория: {category_names.get(category, category)}\n\n"
-            "Опишите ваш вопрос. Можно отправить текст, фото или видео.",
+            "Нажмите кнопку ниже, чтобы войти в диалог и отправить сообщение.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_appeal_{appeal_id}")
-            ]])
+            reply_markup=get_user_appeal_keyboard(appeal_id)
         )
-        context.user_data['waiting_for_appeal'] = True
+        
+        # Уведомляем админов
+        admins = db.get_all_admins()
+        for admin in admins:
+            admin_depts = db.get_admin_departments(admin[0])
+            if category not in admin_depts and "all" not in admin_depts:
+                continue
+            try:
+                admin_msg = f"""
+🆕 *Новое обращение №{appeal_id}*
+🌸 Категория: {category_names.get(category, category)}
+👤 Клиент: @{query.from_user.username or query.from_user.first_name}
+
+Нажмите кнопку ниже, чтобы взять обращение.
+                """
+                await context.bot.send_message(
+                    admin[0],
+                    admin_msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=get_admin_appeal_keyboard(appeal_id, False)
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin[0]}: {e}")
+
+    elif data.startswith("enter_chat_"):
+        appeal_id = int(data.replace("enter_chat_", ""))
+        appeal = db.get_appeal(appeal_id)
+        
+        if not appeal:
+            await query.answer("❌ Обращение не найдено!", show_alert=True)
+            return
+
+        context.user_data['active_appeal'] = appeal_id
+        is_admin = db.is_admin(user_id)
+        
+        await query.edit_message_text(
+            f"💬 *Вы в диалоге обращения №{appeal_id}*\n\n"
+            "Отправляйте сообщения. Они будут доставлены.\n"
+            "Когда закончите, нажмите кнопку выхода.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_exit_chat_keyboard(appeal_id, is_admin)
+        )
+
+    elif data.startswith("exit_chat_"):
+        appeal_id = int(data.replace("exit_chat_", ""))
+        context.user_data.pop('active_appeal', None)
+        
+        appeal = db.get_appeal(appeal_id)
+        is_admin = db.is_admin(user_id)
+        
+        await query.edit_message_text(
+            "🚪 Вы вышли из диалога.",
+            reply_markup=get_main_menu_keyboard(user_id)
+        )
 
     elif data.startswith("cancel_appeal_"):
         appeal_id = int(data.replace("cancel_appeal_", ""))
         db.close_appeal(appeal_id)
-        context.user_data.clear()
+        context.user_data.pop('active_appeal', None)
         await query.edit_message_text(
             "❌ Обращение отменено.",
             reply_markup=get_main_menu_keyboard(user_id)
         )
 
     elif data == "tech_support":
+        open_appeal = db.get_user_open_appeal(user_id)
+        if open_appeal and open_appeal[4] == "support":
+            await query.edit_message_text(
+                f"🔧 У вас уже есть открытое обращение в техподдержку №{open_appeal[0]}.",
+                reply_markup=get_user_appeal_keyboard(open_appeal[0])
+            )
+            return
+
+        appeal_id = db.create_appeal(user_id, query.from_user.username or "", query.from_user.first_name, "support")
+        context.user_data['active_appeal'] = appeal_id
+
         await query.edit_message_text(
-            "🔧 *Техническая поддержка*\n\n"
-            "Если вы обнаружили ошибку или у вас есть предложение, создайте обращение.",
+            f"✅ *Обращение №{appeal_id} создано!*\n"
+            f"🔧 Категория: Техподдержка\n\n"
+            "Нажмите кнопку ниже, чтобы войти в диалог и описать проблему.",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📝 Создать обращение", callback_data="category_support")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
-            ])
+            reply_markup=get_user_appeal_keyboard(appeal_id)
         )
+        
+        # Уведомляем админов
+        admins = db.get_all_admins()
+        for admin in admins:
+            admin_depts = db.get_admin_departments(admin[0])
+            if "support" not in admin_depts and "all" not in admin_depts:
+                continue
+            try:
+                admin_msg = f"""
+🆕 *Новое обращение №{appeal_id}*
+🔧 Категория: Техподдержка
+👤 Клиент: @{query.from_user.username or query.from_user.first_name}
+
+Нажмите кнопку ниже, чтобы взять обращение.
+                """
+                await context.bot.send_message(
+                    admin[0],
+                    admin_msg,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=get_admin_appeal_keyboard(appeal_id, False)
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin[0]}: {e}")
 
     elif data == "back_to_main":
-        context.user_data.clear()
+        context.user_data.pop('active_appeal', None)
         await query.edit_message_text(
             "✨ *Главное меню*\n\nВыберите действие:",
             parse_mode=ParseMode.MARKDOWN,
@@ -629,7 +723,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"✅ Вы взяли обращение №{appeal_id}\n"
                 f"👤 Клиент: @{appeal[2]} ({appeal[3]})\n"
-                f"🌸 Категория: {appeal[4]}",
+                f"🌸 Категория: {appeal[4]}\n\n"
+                "Нажмите кнопку ниже, чтобы войти в диалог.",
                 reply_markup=get_admin_appeal_keyboard(appeal_id, True)
             )
 
@@ -637,13 +732,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     appeal[1],
                     f"👤 *{display_name}* принял(а) ваше обращение и скоро ответит.",
-                    parse_mode=ParseMode.MARKDOWN
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=get_user_appeal_keyboard(appeal_id)
                 )
             except:
                 pass
 
             context.bot_data[f"appeal_{appeal_id}_admin"] = user_id
-            context.bot_data[f"reply_to_{user_id}"] = appeal_id
         else:
             await query.answer("❌ Не удалось взять обращение!", show_alert=True)
 
@@ -681,7 +776,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info_text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Назад", callback_data=f"back_to_appeal_{appeal_id}")
+                InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")
             ]])
         )
 
@@ -694,6 +789,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         appeal = db.get_appeal(appeal_id)
         
         db.close_appeal(appeal_id)
+        context.user_data.pop('active_appeal', None)
 
         if f"appeal_{appeal_id}_admin" in context.bot_data:
             del context.bot_data[f"appeal_{appeal_id}_admin"]
@@ -710,7 +806,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-        await query.edit_message_text(f"✅ Обращение №{appeal_id} завершено.")
+        await query.edit_message_text(f"✅ Обращение №{appeal_id} завершено.", reply_markup=get_main_menu_keyboard(user_id))
 
     elif data.startswith("review_appeal_"):
         appeal_id = int(data.replace("review_appeal_", ""))
@@ -760,7 +856,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 *Напишите ваш отзыв*\n\n"
             f"Оценка: {'⭐' * rating}\n\n"
             "Отправьте текст отзыва одним сообщением:",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="back_to_main")
+            ]])
         )
         return WAITING_REVIEW_TEXT
 
@@ -861,6 +960,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("🔇 У вас ограничена возможность писать запросы.")
         return
 
+    # Обработка отзыва
     if context.user_data.get('waiting_for_review'):
         review_text = message.text or "Без текста"
         appeal_id = context.user_data.get('review_appeal_id')
@@ -906,18 +1006,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if context.user_data.get('waiting_for_appeal'):
-        appeal_id = context.user_data.get('appeal_id')
-
-        if not appeal_id:
-            await message.reply_text("❌ Ошибка! Начните заново.")
-            context.user_data.clear()
-            return
-
-        appeal = db.get_appeal(appeal_id)
+    # Обработка сообщений в диалоге
+    active_appeal_id = context.user_data.get('active_appeal')
+    if active_appeal_id:
+        appeal = db.get_appeal(active_appeal_id)
         if not appeal or appeal[5] == 'closed':
             await message.reply_text("❌ Обращение уже закрыто.")
-            context.user_data.clear()
+            context.user_data.pop('active_appeal', None)
             return
 
         msg_text = message.text or message.caption or ""
@@ -933,115 +1028,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_id = message.video.file_id
             msg_text = message.caption or "[Видео]"
             
-        db.add_appeal_message(appeal_id, user.id, msg_text, msg_type, file_id)
+        db.add_appeal_message(active_appeal_id, user.id, msg_text, msg_type, file_id)
         
-        admins = db.get_all_admins()
-        category_names = {"chat": "Общение", "support": "Поддержка", "other": "Другой вопрос"}
-
-        if appeal[5] == 'open':
+        is_admin = db.is_admin(user.id)
+        is_user_owner = (user.id == appeal[1])
+        
+        # Определяем получателя
+        target_id = None
+        if is_admin and appeal[6]:
+            # Админ пишет клиенту
+            target_id = appeal[1]
+            db.increment_admin_stats(user.id, "message")
+        elif is_user_owner and appeal[6]:
+            # Клиент пишет админу
+            target_id = appeal[6]
+        elif is_user_owner and not appeal[6]:
+            # Клиент пишет, но админ ещё не взят - уведомляем всех админов
+            admins = db.get_all_admins()
+            category_names = {"chat": "Общение", "support": "Поддержка", "other": "Другой вопрос"}
             for admin in admins:
                 admin_depts = db.get_admin_departments(admin[0])
                 if appeal[4] not in admin_depts and "all" not in admin_depts:
                     continue
-                    
                 try:
                     admin_msg = f"""
-🆕 *Новое обращение №{appeal_id}*
-🌸 Категория: {category_names.get(appeal[4], appeal[4])}
-👤 Клиент: @{appeal[2]} ({appeal[3]})
-🆔 ID: `{appeal[1]}`
+📨 *Новое сообщение в обращении №{active_appeal_id}*
+👤 От: @{user.username or user.first_name}
 
-📝 *Сообщение:*
-{msg_text}
+📝 {msg_text}
                     """
                     await context.bot.send_message(
                         admin[0],
                         admin_msg,
                         parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=get_admin_appeal_keyboard(appeal_id, False)
+                        reply_markup=get_admin_appeal_keyboard(active_appeal_id, False)
                     )
                 except Exception as e:
                     logger.error(f"Failed to notify admin {admin[0]}: {e}")
-
-            await message.reply_text(
-                f"✅ Ваше обращение №{appeal_id} отправлено. Ожидайте ответа.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_appeal_{appeal_id}")
-                ]])
-            )
-            context.user_data['waiting_for_appeal'] = False
-
-        elif appeal[5] == 'in_progress' and appeal[6]:
-            try:
-                await context.bot.send_message(
-                    appeal[6],
-                    f"📨 *Новое сообщение в обращении №{appeal_id}*\n"
-                    f"👤 От: @{user.username or user.id}\n\n"
-                    f"📝 {msg_text}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_admin_appeal_keyboard(appeal_id, True)
-                )
-                db.increment_admin_stats(appeal[6], "message")
-            except Exception as e:
-                logger.error(f"Failed to forward to admin {appeal[6]}: {e}")
-
-            await message.reply_text("✅ Сообщение отправлено.")
-        return
-
-    reply_to_id = context.bot_data.get(f"reply_to_{user.id}")
-    if reply_to_id:
-        appeal_id = reply_to_id
-        
-        if not message.reply_to_message:
-            await message.reply_text("❌ Ответьте на сообщение пользователя!")
+            
+            await message.reply_text("✅ Сообщение отправлено. Ожидайте, пока администратор возьмёт обращение.",
+                reply_markup=get_exit_chat_keyboard(active_appeal_id, False))
             return
 
-        appeal = db.get_appeal(appeal_id)
-
-        if appeal and appeal[1]:
-            msg_text = message.text or message.caption or ""
-            msg_type = "text"
-            file_id = None
-            
-            if message.photo:
-                msg_type = "photo"
-                file_id = message.photo[-1].file_id
-                msg_text = message.caption or "[Фото]"
-            elif message.video:
-                msg_type = "video"
-                file_id = message.video.file_id
-                msg_text = message.caption or "[Видео]"
-                
-            db.add_appeal_message(appeal_id, user.id, msg_text, "admin_reply", file_id)
-            db.increment_admin_stats(user.id, "message")
-
-            admin = db.get_admin(user.id)
-            display_name = admin[2] if admin else "Администратор"
-
+        if target_id:
             try:
                 if message.photo:
                     await context.bot.send_photo(
-                        appeal[1],
+                        target_id,
                         file_id,
-                        caption=f"👤 *{display_name}*\n\n📝 {msg_text}",
+                        caption=f"📝 *Сообщение в обращении №{active_appeal_id}*\n\n{msg_text}",
                         parse_mode=ParseMode.MARKDOWN
                     )
                 elif message.video:
                     await context.bot.send_video(
-                        appeal[1],
+                        target_id,
                         file_id,
-                        caption=f"👤 *{display_name}*\n\n📝 {msg_text}",
+                        caption=f"📝 *Сообщение в обращении №{active_appeal_id}*\n\n{msg_text}",
                         parse_mode=ParseMode.MARKDOWN
                     )
                 else:
                     await context.bot.send_message(
-                        appeal[1],
-                        f"👤 *{display_name}*\n\n📝 {message.text}",
+                        target_id,
+                        f"📝 *Сообщение в обращении №{active_appeal_id}*\n\n{message.text}",
                         parse_mode=ParseMode.MARKDOWN
                     )
-                await message.reply_text("✅ Ответ отправлен.")
+                await message.reply_text("✅ Сообщение отправлено.",
+                    reply_markup=get_exit_chat_keyboard(active_appeal_id, is_admin))
             except Exception as e:
-                await message.reply_text(f"❌ Ошибка: {e}")
+                await message.reply_text(f"❌ Ошибка отправки: {e}")
+        else:
+            await message.reply_text("❌ Невозможно отправить сообщение.",
+                reply_markup=get_exit_chat_keyboard(active_appeal_id, is_admin))
         return
 
 async def handle_mailing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1128,6 +1185,13 @@ async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 async def staff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Только для админов
+    if not db.is_admin(user_id):
+        await update.message.reply_text("❌ Только для администраторов!")
+        return
+
     admins = db.get_all_admins()
     
     if not admins:
@@ -1147,6 +1211,7 @@ async def staff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+# Все остальные команды остаются без изменений
 @owner_required
 async def sysadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -1924,7 +1989,7 @@ def main():
     application.add_handler(mailing_conv)
 
     application.add_handler(MessageHandler(
-        filters.TEXT | filters.PHOTO | filters.VIDEO & ~filters.COMMAND,
+        filters.ALL & ~filters.COMMAND,
         handle_message
     ))
 
