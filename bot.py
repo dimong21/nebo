@@ -131,6 +131,7 @@ class Database:
                 is_anonymous BOOLEAN DEFAULT 0,
                 category TEXT,
                 admin_id INTEGER,
+                admin_name TEXT,
                 rating INTEGER,
                 text TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -265,7 +266,6 @@ class Database:
         return []
 
     def get_admin_departments(self, user_id: int) -> list:
-        """Возвращает список отделов админа. Пустой список = нет доступа ни к чему."""
         if user_id == OWNER_ID:
             return ["chat", "support", "other"]
         self.cursor.execute('SELECT departments FROM admins WHERE user_id = ?', (user_id,))
@@ -285,18 +285,16 @@ class Database:
         return "all" in perms or permission in perms
 
     def can_handle_category(self, user_id: int, category: str) -> bool:
-        """Проверяет, может ли админ работать с обращениями этой категории"""
         if user_id == OWNER_ID:
             return True
         depts = self.get_admin_departments(user_id)
-        return "all" in depts or category in depts
+        return category in depts
 
     def get_all_admins(self):
         self.cursor.execute('SELECT user_id, username, display_name, position, level, rating, total_reviews FROM admins ORDER BY level DESC, rating DESC')
         return self.cursor.fetchall()
 
     def get_admins_for_category(self, category: str):
-        """Возвращает админов, у которых есть доступ к категории"""
         admins = self.get_all_admins()
         result = []
         for admin in admins:
@@ -380,12 +378,12 @@ class Database:
         ''', (admin_id, today))
         return self.cursor.fetchall()
 
-    def add_review(self, user_id: int, username: str, display_name: str, is_anonymous: bool, 
-                   category: str, admin_id: int, rating: int, text: str):
+    def add_review(self, user_id: int, username: str, display_name: str, is_anonymous: bool,
+                   category: str, admin_id: int, admin_name: str, rating: int, text: str):
         self.cursor.execute('''
-            INSERT INTO reviews (user_id, username, display_name, is_anonymous, category, admin_id, rating, text)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, username, display_name, is_anonymous, category, admin_id, rating, text))
+            INSERT INTO reviews (user_id, username, display_name, is_anonymous, category, admin_id, admin_name, rating, text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, display_name, is_anonymous, category, admin_id, admin_name, rating, text))
         self.conn.commit()
         if admin_id:
             self.cursor.execute('''
@@ -456,20 +454,6 @@ def extract_user_id(text: str) -> Optional[int]:
         return admin[0]
     return None
 
-def notify_admins_by_category(context: ContextTypes.DEFAULT_TYPE, category: str, text: str, reply_markup=None):
-    """Отправляет уведомление только админам с доступом к категории"""
-    admins = db.get_admins_for_category(category)
-    for admin in admins:
-        try:
-            context.bot.send_message(
-                admin[0],
-                text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            logger.error(f"Failed to notify admin {admin[0]}: {e}")
-
 def get_main_menu_keyboard(user_id: int):
     keyboard = [
         [InlineKeyboardButton("✨ Информация", callback_data="info")],
@@ -537,7 +521,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "info":
         await query.edit_message_text(
-            "✨ *Сияние Неба — Бот Поддержки* ✨\n\n🌸 *О нас:*\nСияние Неба — это команда профессионалов.\n\n🌟 *Что мы предлагаем:*\n• Оперативную поддержку\n• Решение технических вопросов\n\nВерсия: 7.0.0",
+            "✨ *Сияние Неба — Бот Поддержки* ✨\n\n🌸 *О нас:*\nСияние Неба — это команда профессионалов, готовая помочь вам в любой ситуации.\n\n🌟 *Что мы предлагаем:*\n• Оперативную поддержку\n• Решение технических вопросов\n\nВерсия: 8.0.0",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]])
         )
@@ -564,7 +548,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Обращение №{appeal_id} создано!*\n🌸 Категория: {category_names.get(category, category)}\n\nНажмите кнопку ниже, чтобы войти в диалог.",
             parse_mode=ParseMode.MARKDOWN, reply_markup=get_user_appeal_keyboard(appeal_id)
         )
-        # Уведомляем ТОЛЬКО админов с доступом к этой категории
+        # Уведомляем админов с доступом к категории
         category_admins = db.get_admins_for_category(category)
         for admin in category_admins:
             try:
@@ -605,7 +589,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         appeal_id = db.create_appeal(user_id, query.from_user.username or "", query.from_user.first_name, "support")
         context.user_data['active_appeal'] = appeal_id
         await query.edit_message_text(f"✅ *Обращение №{appeal_id} создано!*\n🔧 Категория: Техподдержка\n\nНажмите кнопку ниже, чтобы войти в диалог.", parse_mode=ParseMode.MARKDOWN, reply_markup=get_user_appeal_keyboard(appeal_id))
-        # Уведомляем ТОЛЬКО админов с доступом к support
         category_admins = db.get_admins_for_category("support")
         for admin in category_admins:
             try:
@@ -626,7 +609,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not appeal:
             await query.answer("❌ Обращение не найдено!", show_alert=True)
             return
-        # Проверяем доступ к категории
         if not db.can_handle_category(user_id, appeal[4]):
             await query.answer(f"❌ У вас нет доступа к категории '{appeal[4]}'!", show_alert=True)
             return
@@ -668,10 +650,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         appeal_id = int(data.replace("close_appeal_", ""))
         appeal = db.get_appeal(appeal_id)
+        admin_name = "Неизвестный"
+        if appeal[6]:
+            a = db.get_admin(appeal[6])
+            if a:
+                admin_name = a[2]
         db.close_appeal(appeal_id)
         context.user_data.pop('active_appeal', None)
         try:
-            await context.bot.send_message(appeal[1], f"🌸 Ваше обращение №{appeal_id} завершено.\n\nПожалуйста, оставьте отзыв о работе администратора!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Оставить отзыв", callback_data=f"review_appeal_{appeal_id}")]]))
+            await context.bot.send_message(appeal[1], f"🌸 Ваше обращение №{appeal_id} завершено.\n\nПожалуйста, оставьте отзыв о работе администратора *{admin_name}*!", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Оставить отзыв", callback_data=f"review_appeal_{appeal_id}")]]))
         except:
             pass
         await query.edit_message_text(f"✅ Обращение №{appeal_id} завершено.", reply_markup=get_main_menu_keyboard(user_id))
@@ -685,6 +672,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['review_appeal_id'] = appeal_id
         context.user_data['review_admin_id'] = appeal[6]
         context.user_data['review_category'] = appeal[4]
+        # Сохраняем имя админа
+        if appeal[6]:
+            a = db.get_admin(appeal[6])
+            context.user_data['review_admin_name'] = a[2] if a else "Неизвестный"
+        else:
+            context.user_data['review_admin_name'] = "Неизвестный"
         await query.edit_message_text("🌸 *Оставить отзыв*\n\nКак вы хотите оставить отзыв?", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 Открыто", callback_data="review_anon_no")], [InlineKeyboardButton("🥷 Анонимно", callback_data="review_anon_yes")]]))
 
     elif data.startswith("review_anon_"):
@@ -694,8 +687,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("review_rating_"):
         rating = int(data.replace("review_rating_", ""))
         context.user_data['review_rating'] = rating
+        context.user_data['waiting_for_review'] = True
         await query.edit_message_text(f"📝 *Напишите ваш отзыв*\n\nОценка: {'⭐' * rating}\n\nОтправьте текст отзыва одним сообщением:", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="back_to_main")]]))
-        return WAITING_REVIEW_TEXT
 
     elif data == "mailing_menu":
         if not db.has_permission(user_id, "mailing"):
@@ -757,18 +750,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         review_text = message.text or message.caption or "Без текста"
         appeal_id = context.user_data.get('review_appeal_id')
         admin_id = context.user_data.get('review_admin_id')
+        admin_name = context.user_data.get('review_admin_name', 'Неизвестный')
         category = context.user_data.get('review_category', 'other')
         rating = context.user_data.get('review_rating', 5)
         is_anonymous = context.user_data.get('review_anonymous', False)
         display_name = f"@{user.username}" if user.username and not is_anonymous else (user.first_name if not is_anonymous else "Аноним")
-        db.add_review(user.id, user.username or "", display_name, is_anonymous, category, admin_id, rating, review_text)
-        context.user_data.clear()
+
+        # Сохраняем отзыв в БД
+        db.add_review(user.id, user.username or "", display_name, is_anonymous, category, admin_id, admin_name, rating, review_text)
+
+        # Отправляем в чат отзывов
         if REVIEWS_CHAT_ID:
+            category_names = {"chat": "Общение", "support": "Поддержка", "other": "Другое"}
+            stars = "⭐" * rating
+            review_msg = f"⭐ *Новый отзыв!*\n👤 От: {display_name}\n📂 Категория: {category_names.get(category, category)}\n👨‍💼 Администратор: {admin_name}\n{stars} ({rating}/5)\n\n📝 *Отзыв:*\n{review_text}"
             try:
-                await context.bot.send_message(REVIEWS_CHAT_ID, f"⭐ *Новый отзыв!*\n👤 От: {display_name}\n📂 Категория: {category}\n{'⭐' * rating} ({rating}/5)\n\n📝 *Отзыв:*\n{review_text}", parse_mode=ParseMode.MARKDOWN)
-            except:
-                pass
-        await message.reply_text("🌸 Спасибо за ваш отзыв!", reply_markup=get_main_menu_keyboard(user.id))
+                await context.bot.send_message(REVIEWS_CHAT_ID, review_msg, parse_mode=ParseMode.MARKDOWN)
+                await message.reply_text("🌸 Спасибо за ваш отзыв! Он отправлен в чат администрации.")
+            except Exception as e:
+                logger.error(f"Failed to send review to chat: {e}")
+                await message.reply_text("🌸 Спасибо за ваш отзыв! К сожалению, не удалось отправить его в чат, но он сохранён.")
+        else:
+            await message.reply_text("🌸 Спасибо за ваш отзыв!")
+        
+        context.user_data.clear()
         return
 
     # Диалог
@@ -797,7 +802,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif user.id == appeal[1] and appeal[6]:
             target_id = appeal[6]
         elif user.id == appeal[1]:
-            # Уведомляем ТОЛЬКО админов с доступом к категории
             category_admins = db.get_admins_for_category(appeal[4])
             for a in category_admins:
                 try:
@@ -843,7 +847,6 @@ async def reports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
     appeals = db.get_open_appeals()
-    # Фильтруем обращения по отделам админа
     filtered = []
     for a in appeals:
         if db.can_handle_category(user_id, a[4]):
@@ -939,12 +942,12 @@ async def admin_set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     perms = db.get_admin_permissions(target_id)
     depts = db.get_admin_departments(target_id)
-    all_perms = ["manage_admins", "sysban", "mute", "mailing", "all"]
+    all_perms = ["manage_admins", "sysban", "mute", "mailing"]
     all_depts = ["chat", "support", "other"]
     keyboard = []
-    pn = {"manage_admins": "Управление админами", "sysban": "Системные баны", "mute": "Муты", "mailing": "Рассылка", "all": "Все права"}
+    pn = {"manage_admins": "Управление админами", "sysban": "Системные баны", "mute": "Муты", "mailing": "Рассылка"}
     for p in all_perms:
-        status = "✅" if ("all" in perms or p in perms) else "❌"
+        status = "✅" if (p in perms) else "❌"
         keyboard.append([InlineKeyboardButton(f"{status} {pn.get(p, p)}", callback_data=f"setperm_{target_id}_{p}")])
     dn = {"chat": "💬 Общение", "support": "🛟 Поддержка", "other": "❓ Другое"}
     for d in all_depts:
@@ -1197,23 +1200,18 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("❌ Нет прав!", show_alert=True)
             return
         perms = db.get_admin_permissions(target_id)
-        if perm == "all":
-            perms = [] if "all" in perms else ["all"]
+        if perm in perms:
+            perms.remove(perm)
         else:
-            if "all" in perms:
-                perms.remove("all")
-            if perm in perms:
-                perms.remove(perm)
-            else:
-                perms.append(perm)
+            perms.append(perm)
         db.update_admin_permissions(target_id, perms)
         depts = db.get_admin_departments(target_id)
-        all_perms = ["manage_admins", "sysban", "mute", "mailing", "all"]
+        all_perms = ["manage_admins", "sysban", "mute", "mailing"]
         all_depts = ["chat", "support", "other"]
         keyboard = []
-        pn = {"manage_admins": "Управление админами", "sysban": "Системные баны", "mute": "Муты", "mailing": "Рассылка", "all": "Все права"}
+        pn = {"manage_admins": "Управление админами", "sysban": "Системные баны", "mute": "Муты", "mailing": "Рассылка"}
         for p in all_perms:
-            status = "✅" if ("all" in perms or p in perms) else "❌"
+            status = "✅" if p in perms else "❌"
             keyboard.append([InlineKeyboardButton(f"{status} {pn.get(p, p)}", callback_data=f"setperm_{target_id}_{p}")])
         dn = {"chat": "💬 Общение", "support": "🛟 Поддержка", "other": "❓ Другое"}
         for d in all_depts:
@@ -1236,12 +1234,12 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             depts.append(dept)
         db.update_admin_departments(target_id, depts)
         perms = db.get_admin_permissions(target_id)
-        all_perms = ["manage_admins", "sysban", "mute", "mailing", "all"]
+        all_perms = ["manage_admins", "sysban", "mute", "mailing"]
         all_depts = ["chat", "support", "other"]
         keyboard = []
-        pn = {"manage_admins": "Управление админами", "sysban": "Системные баны", "mute": "Муты", "mailing": "Рассылка", "all": "Все права"}
+        pn = {"manage_admins": "Управление админами", "sysban": "Системные баны", "mute": "Муты", "mailing": "Рассылка"}
         for p in all_perms:
-            status = "✅" if ("all" in perms or p in perms) else "❌"
+            status = "✅" if p in perms else "❌"
             keyboard.append([InlineKeyboardButton(f"{status} {pn.get(p, p)}", callback_data=f"setperm_{target_id}_{p}")])
         dn = {"chat": "💬 Общение", "support": "🛟 Поддержка", "other": "❓ Другое"}
         for d in all_depts:
